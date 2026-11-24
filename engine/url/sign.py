@@ -1,13 +1,14 @@
 """签名下载链接的核心实现。
 
-本模块只有 8 个公开函数，当前全部是桩。测试位于 tests/url/test_sign.py，
-不可修改；修复只能发生在本文件。契约以各函数 docstring 为准。
+本模块共 8 个公开函数。测试位于 tests/url/test_sign.py，
+不可修改；实现以各函数 docstring 的契约为准。
 """
 
 from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import time
 import urllib.parse
 
@@ -30,7 +31,17 @@ def canonical_string(method: str, path: str, expires: int, extra: dict[str, str]
         canonical_string("GET", "/files/a", 1000, {"b": "2", "a": "1"})
         返回 expires=1000&extra=a%3D1%26b%3D2&method=GET&path=%2Ffiles%2Fa
     """
-    raise NotImplementedError
+    inner = "&".join(f"{key}={extra[key]}" for key in sorted(extra))
+    fields = {
+        "expires": str(expires),
+        "extra": inner,
+        "method": method,
+        "path": path,
+    }
+    return "&".join(
+        f"{key}={urllib.parse.quote(fields[key], safe='')}"
+        for key in ("expires", "extra", "method", "path")
+    )
 
 
 def sign(secret: str, canonical: str) -> str:
@@ -38,7 +49,9 @@ def sign(secret: str, canonical: str) -> str:
 
     secret 与 canonical 均按 UTF-8 编码；返回值固定为 64 个十六进制字符。
     """
-    raise NotImplementedError
+    return hmac.new(
+        secret.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
 
 
 def verify(secret: str, canonical: str, provided: str) -> bool:
@@ -47,7 +60,10 @@ def verify(secret: str, canonical: str, provided: str) -> bool:
     必须使用 hmac.compare_digest 比较，禁止使用普通等号。provided 不是
     字符串时返回 False；签名正确返回 True，否则返回 False。
     """
-    raise NotImplementedError
+    if not isinstance(provided, str):
+        return False
+    expected = sign(secret, canonical)
+    return hmac.compare_digest(expected, provided)
 
 
 def expiry_ok(expires: int, now: int, max_ttl: int) -> bool:
@@ -57,7 +73,9 @@ def expiry_ok(expires: int, now: int, max_ttl: int) -> bool:
     时钟容差为 0，即只接受上述闭区间内的链接，不做任何宽限。
     max_ttl 为负时返回 False。
     """
-    raise NotImplementedError
+    if max_ttl < 0:
+        return False
+    return now <= expires <= now + max_ttl
 
 
 def scope_ok(path: str, allowed_prefixes: list[str]) -> bool:
@@ -67,7 +85,13 @@ def scope_ok(path: str, allowed_prefixes: list[str]) -> bool:
     “前缀 + /” 开头才算命中，例如 /reports2 不属于 /reports。
     allowed_prefixes 为空返回 False；不处理 . 与 .. 段。
     """
-    raise NotImplementedError
+    for prefix in allowed_prefixes:
+        prefix = prefix.rstrip("/")
+        if prefix == "":
+            return True
+        if path == prefix or path.startswith(prefix + "/"):
+            return True
+    return False
 
 
 def ip_bind_ok(signed_ip: str, request_ip: str) -> bool:
@@ -77,7 +101,14 @@ def ip_bind_ok(signed_ip: str, request_ip: str) -> bool:
     request_ip 是单个 IPv4 地址。命中返回 True；任一侧格式非法返回 False。
     仅支持 IPv4，不做 DNS 解析。
     """
-    raise NotImplementedError
+    try:
+        request = ipaddress.IPv4Address(request_ip)
+        if "/" in signed_ip:
+            network = ipaddress.IPv4Network(signed_ip, strict=False)
+            return request in network
+        return request == ipaddress.IPv4Address(signed_ip)
+    except (ipaddress.AddressValueError, ipaddress.NetmaskValueError, ValueError):
+        return False
 
 
 def validate_policy(policy: dict) -> list[str]:
@@ -90,7 +121,27 @@ def validate_policy(policy: dict) -> list[str]:
     PATH_ISSUE；require_ip_binding 必须为 True，否则追加 IP_ISSUE。
     全部满足时返回空列表。
     """
-    raise NotImplementedError
+    issues: list[str] = []
+    max_ttl = policy.get("max_ttl")
+    if (
+        not isinstance(max_ttl, int)
+        or isinstance(max_ttl, bool)
+        or not 1 <= max_ttl <= MAX_TTL
+    ):
+        issues.append(TTL_ISSUE)
+    prefixes = policy.get("allowed_prefixes")
+    if (
+        not isinstance(prefixes, list)
+        or not prefixes
+        or any(
+            not isinstance(prefix, str) or not prefix.startswith("/") or prefix == "/"
+            for prefix in prefixes
+        )
+    ):
+        issues.append(PATH_ISSUE)
+    if policy.get("require_ip_binding") is not True:
+        issues.append(IP_ISSUE)
+    return issues
 
 
 def url_batch(requests: list[dict], policy: dict, now: int) -> dict[int, bool]:
@@ -102,4 +153,20 @@ def url_batch(requests: list[dict], policy: dict, now: int) -> dict[int, bool]:
     ip_bind_ok(policy["signed_ip"], request["ip"])。
     不得跨请求复用规范化串或签名结果。
     """
-    raise NotImplementedError
+    results: dict[int, bool] = {}
+    policy_ok = not validate_policy(policy)
+    secret = policy.get("secret", "")
+    for index, request in enumerate(requests):
+        canonical = canonical_string(
+            request["method"], request["path"], request["expires"], request["extra"]
+        )
+        ok = (
+            policy_ok
+            and verify(secret, canonical, request["signature"])
+            and expiry_ok(request["expires"], now, policy["max_ttl"])
+            and scope_ok(request["path"], policy["allowed_prefixes"])
+        )
+        if ok and policy.get("require_ip_binding") is True:
+            ok = ip_bind_ok(policy["signed_ip"], request["ip"])
+        results[index] = ok
+    return results
